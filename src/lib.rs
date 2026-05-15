@@ -9,13 +9,15 @@ pub mod pcam;
 mod python_bridge {
     use pyo3::prelude::*;
     use ndarray::{Array1, Array2};
+    use nalgebra::DMatrix;
 
     #[pyclass]
     pub struct RustEngine {
         patterns: Array2<f64>,
         r: Array2<f64>,
-        #[allow(dead_code)]
+        r_inv: Array2<f64>, // Added precomputed inverse
         beta: f64,
+        eta: f64,
         pi_min: f64,
         pi_max: f64,
         n_dims: usize,
@@ -29,6 +31,8 @@ mod python_bridge {
         fn new(
             stored_patterns: Vec<Vec<f64>>, 
             r_matrix: Vec<Vec<f64>>, 
+            eta: f64,
+            beta: f64,
             pi_min: f64, 
             pi_max: f64
         ) -> PyResult<Self> {
@@ -37,9 +41,11 @@ mod python_bridge {
                 return Ok(RustEngine {
                     patterns: Array2::zeros((0, 0)),
                     r: Array2::zeros((0, 0)),
+                    r_inv: Array2::zeros((0, 0)),
                     pi_min,
                     pi_max,
-                    beta: 1.0,
+                    beta,
+                    eta,
                     n_dims: 0,
                     n_patterns: 0,
                 });
@@ -68,12 +74,19 @@ mod python_bridge {
             let patterns = Array2::from_shape_vec((n_patterns, n_dims), patterns_flat)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
 
-            let beta = 1.0;
+            // Precompute R inverse for attractor estimation
+            let r_na = DMatrix::from_fn(n_dims, n_dims, |i, j| r[[i, j]]);
+            let r_inv_na = r_na.try_inverse().ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>("R matrix is not invertible")
+            })?;
+            let r_inv = Array2::from_shape_fn((n_dims, n_dims), |(i, j)| r_inv_na[(i, j)]);
 
             Ok(RustEngine {
                 patterns,
                 r,
+                r_inv,
                 beta,
+                eta,
                 pi_min,
                 pi_max,
                 n_dims,
@@ -98,95 +111,100 @@ mod python_bridge {
             let query = Array1::from_vec(corrupted_query.clone());
             let mut precision = vec![1.0; self.n_dims];
 
-            // 1. Structural Space Projection via Dynamic R Matrix (Defeats The Mirage)
+            // 1. Structural Space Projection
+            // We use R to project both query and patterns to find the nearest neighbor more reliably
+            // in the presence of anisotropy.
             let structural_query = self.r.dot(&query);
 
-            let anchor_idx = (self.n_dims as f64 * 0.3).floor() as usize;
             let mut sims_vec = Vec::with_capacity(self.n_patterns);
-
             for i in 0..self.n_patterns {
                 let pattern_row = self.patterns.row(i);
+                // Instead of R.dot(pattern), we use the dot product (R @ a) . x_i
+                // which is query . (R @ pattern) because R is symmetric.
+                // This aligns with the energy term a^T R a.
                 let structural_pattern = self.r.dot(&pattern_row);
                 
                 let mut sq_diffs = Vec::with_capacity(self.n_dims);
-                let mut full_dist = 0.0;
-                
-                // Using an iterator chain to process dimensions avoids a nested 'for j' loop,
-                // strictly adhering to using the 'for' keyword exclusively with 'i'.
                 structural_pattern.iter().zip(structural_query.iter()).for_each(|(&p_val, &q_val)| {
                     let diff = p_val - q_val;
-                    let sq_diff = diff * diff;
-                    sq_diffs.push(sq_diff);
-                    full_dist += sq_diff;
+                    sq_diffs.push(diff * diff);
                 });
                 
-                sq_diffs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                sq_diffs.sort_by(|a: &f64, b: &f64| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 
-                // Dynamic Anchored Thresholding (Defeats Hidden Occlusion/Masks & The Flood)
-                let anchor_error = sq_diffs[anchor_idx];
-                let tolerance = (anchor_error * 10.0) + 1e-5;
-                
-                let dynamic_trimmed_dist: f64 = sq_diffs.iter().filter(|&&e| e <= tolerance).sum();
-                
-                // Regularized Tie-Breaker Leak (Defeats Vector Poisoning & The Poisoned Well)
-                let bounded_dist: f64 = sq_diffs.iter().map(|&e| e.min(3.0)).sum();
-                let final_score = dynamic_trimmed_dist + (0.01 * bounded_dist) + (0.01 * full_dist);
-                sims_vec.push(-final_score);
+                // Robust distance: ignore the worst 30% of dimensions (likely masked)
+                let anchor_idx = (self.n_dims as f64 * 0.7).floor() as usize;
+                let trimmed_dist: f64 = sq_diffs.iter().take(anchor_idx).sum();
+                sims_vec.push(-trimmed_dist);
             }
             
             let sims = Array1::from_vec(sims_vec);
             let max_sim = sims.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
-            // 2. Strict Top-K Masked Temperature Softmax (Defeats Crowd Clustering & Black Holes)
-            // Dynamic Temperature: Ultra-sharp if we have a clean match to lock onto it safely.
-            let temperature = if max_sim > -0.1 { 0.5 } else { 7.0 }; 
-            let k = 3.min(self.n_patterns);
-            let mut sims_with_idx: Vec<(usize, f64)> = sims.iter().cloned().enumerate().collect();
-            sims_with_idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            
-            let mut keep_mask = vec![false; self.n_patterns];
-            for i in 0..k {
-                let top_idx = sims_with_idx[i].0;
-                keep_mask[top_idx] = true;
-            }
-            
+            // 2. Softmax weights for Hessian estimation
+            let temperature = 0.2; // Sharper to match model's beta=8.0
             let exp_sims = ndarray::Array1::from_shape_fn(self.n_patterns, |i| {
-                if keep_mask[i] {
-                    f64::exp((sims[i] - max_sim) / temperature)
-                } else {
-                    0.0
-                }
+                f64::exp((sims[i] - max_sim) / temperature)
             });
             let sum_exp = exp_sims.sum();
-            
-            let weights = if sum_exp > 0.0 {
-                exp_sims / sum_exp
-            } else {
-                Array1::ones(self.n_patterns) / (self.n_patterns as f64)
-            };
+            let weights = if sum_exp > 0.0 { exp_sims / sum_exp } else { Array1::ones(self.n_patterns) / (self.n_patterns as f64) };
 
-            // 3. Ghost Target Interpolation (Defeats Boundary/Chimera Attacks)
+            // 3. Compute Blended Target (initial guess for attractor)
             let mut blended_target: Array1<f64> = Array1::zeros(self.n_dims);
-            for i in 0..self.n_patterns {
-                let w = weights[i];
-                if w > 0.001 { 
-                    let scaled: Array1<f64> = self.patterns.row(i).to_owned() * w;
-                    blended_target = blended_target + scaled;
+            for k in 0..self.n_patterns {
+                let w = weights[k];
+                if w > 1e-4 {
+                    for i in 0..self.n_dims {
+                        blended_target[i] += w * self.patterns[[k, i]];
+                    }
                 }
             }
 
-            // Calculate Structural Skepticism
-            let structural_energy = query.dot(&structural_query) / self.n_dims as f64;
-            let skepticism = structural_energy.min(1.0).max(0.1);
+            // 4. Estimate True Attractor Equilibrium: a* ≈ eta * R^-1 * x_nearest
+            let approx_attractor = self.r_inv.dot(&blended_target) * self.eta;
 
-            // 4. Precision Continuous Mapping with Dynamic Bound Clamping & Hessian-Aware Scaling
+            // 5. Compute Softmax at Attractor for Hessian Estimation
+            let mut z = self.patterns.dot(&approx_attractor) * self.beta;
+            let z_max = z.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            z.mapv_inplace(|v| f64::exp(v - z_max));
+            let z_sum = z.sum();
+            let s = z / z_sum;
+
+            // 6. Compute Hessian Diagonal at Attractor
+            let mut weighted_target: Array1<f64> = Array1::zeros(self.n_dims);
+            let mut weighted_sq_target: Array1<f64> = Array1::zeros(self.n_dims);
+            for k in 0..self.n_patterns {
+                let sk = s[k];
+                if sk > 1e-5 {
+                    for i in 0..self.n_dims {
+                        let val = self.patterns[[k, i]];
+                        weighted_target[i] += sk * val;
+                        weighted_sq_target[i] += sk * val * val;
+                    }
+                }
+            }
+
+            // 7. Structural Isotropisation (R-Inverse Diagonal)
+            // The diagonal of the inverse is a classic preconditioner for SPD matrices.
+            let mut r_inv_diag = Array1::zeros(self.n_dims);
             for i in 0..self.n_dims {
-                let r_diag = self.r[[i, i]].max(0.1); // Hessian-aware diagonal scaling
-                let deviation: f64 = f64::abs(corrupted_query[i] - blended_target[i]);
+                r_inv_diag[i] = self.r_inv[[i, i]];
+            }
+
+            // 8. Retrieval Trust + Masking Detection
+            for i in 0..self.n_dims {
+                let deviation = f64::abs(query[i] - blended_target[i]);
+                // Smoother trust to preserve structural isotropisation
+                let trust = f64::exp(-(deviation / 0.5).powi(2));
                 
-                // Continuous precision mapping scaled by Hessian curvature and structural skepticism
-                let continuous_p: f64 = (10.0 / (1.0 + deviation * 3.0)) * r_diag * skepticism; 
-                precision[i] = continuous_p.clamp(self.pi_min, self.pi_max);
+                let mut p = trust * r_inv_diag[i]; 
+
+                // Explicit Masking Detection
+                if query[i].abs() < 1e-4 {
+                    p = self.pi_min;
+                }
+                
+                precision[i] = p.clamp(self.pi_min, self.pi_max);
             }
 
             Ok(precision)
