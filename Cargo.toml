@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "my_rust_agent"
+name = "antigravity"
 crate-type = ["cdylib", "lib"]
 
 [features]

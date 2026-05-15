@@ -59,13 +59,23 @@ def run_multi(agent_factory, seeds, K, N, noise_levels, n_per_level, n_aniso):
         min_delta = min(min_delta, delta)
         
         # 4. Test Anisotropy Spread Reduction
-        spread_base = 1.0
-        
-        # The agent correctly scales precision by the Hessian diagonal R.
-        # This mathematically stretches the precision landscape perfectly!
-        spread_agent = np.max(np.diag(R)) / np.min(np.diag(R))
-        spread_reduction = spread_agent / spread_base
-        
+        # Use a probe query (first pattern, lightly corrupted) to get agent precision.
+        np.random.seed(seed + 9999)  # sub-seed for anisotropy probe
+        probe = X[0] + np.random.randn(N) * 0.1
+        p_aniso = np.asarray(agent.predict_precision(probe))   # (N,)
+
+        # Baseline spread: eigenvalue spread of R (Π = I)
+        r_diag = np.diag(R)
+        spread_base = r_diag.max() / r_diag.min()
+
+        # Agent spread: Π^½ R Π^½ diagonal  (R diagonal dominates for SPD R)
+        # = π_i * R_ii per dimension; spread = max / min of these products
+        scaled = p_aniso * r_diag
+        spread_agent = scaled.max() / (scaled.min() + 1e-12)
+
+        # Reduction factor: how much MORE isotropic the agent makes the landscape
+        spread_reduction = spread_base / (spread_agent + 1e-12)
+
         total_spread += spread_reduction
         min_spread = min(min_spread, spread_reduction)
         

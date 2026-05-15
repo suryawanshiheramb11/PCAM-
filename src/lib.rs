@@ -194,7 +194,7 @@ mod python_bridge {
     }
 
     #[pymodule]
-    pub fn my_rust_agent(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    pub fn antigravity(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<RustEngine>()?;
         Ok(())
     }
