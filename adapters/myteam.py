@@ -1,9 +1,10 @@
 import numpy as np
+import my_rust_agent
 
 class Engine:
     """
     Precision estimator that compares noisy inputs against stored patterns
-    using variance-weighted distance metrics.
+    using variance-weighted distance metrics AND the compiled Rust Engine.
     """
     def __init__(self, stored_patterns: np.ndarray, model_params: dict):
         # 1. Input Validation
@@ -16,51 +17,44 @@ class Engine:
         self.pi_max = float(model_params.get("pi_max", 10.0))
         
         # 2. Precompute Inverse-Variance Weights
-        # Calculate how much each dimension naturally varies across all stored patterns.
         pattern_var = np.var(self.X, axis=0)  # (N,)
-        
-        # We want to penalize dimensions with high variance (they are less informative).
-        # Add a small epsilon (1e-8) to prevent division by zero for constant dimensions.
         self.precision_weights = 1.0 / (pattern_var + 1e-8)
-        
-        # Normalize weights so they sum to N (average weight is 1.0).
-        # This keeps the overall scale of our distance metric consistent.
         self.precision_weights /= np.mean(self.precision_weights)
 
+        # 3. Instantiate the high-performance Rust Engine
+        R_matrix = model_params.get("R")
+        if isinstance(R_matrix, np.ndarray):
+            R_list = R_matrix.tolist()
+        else:
+            R_list = R_matrix
+
+        self.rust_engine = my_rust_agent.RustEngine(
+            self.X.tolist(), 
+            R_list, 
+            self.pi_min, 
+            self.pi_max
+        )
+
     def predict_precision(self, corrupted_query: np.ndarray, temperature: float = 1.0) -> np.ndarray:
-        """
-        Estimates the reliability (precision) of each dimension in the query.
-        
-        Args:
-            corrupted_query: 1D array of shape (N,)
-            temperature: Controls how strictly to penalize errors. 
-                         Higher = more forgiving, Lower = strict penalty.
-        Returns:
-            precision: 1D array of shape (N,) bounded by [pi_min, pi_max]
-        """
-        # Defensive check to ensure the query matches the expected dimension size
         if corrupted_query.shape != (self.N,):
             raise ValueError(f"corrupted_query must have shape ({self.N},), got {corrupted_query.shape}")
 
-        # Step 1: Find the nearest stored pattern (Weighted Mahalanobis-style distance)
-        diffs = self.X - corrupted_query  # (K, N)
+        # --- PATH A: Pure Python Variance-Weighted Estimation ---
+        diffs = self.X - corrupted_query  
+        dists = np.sum((diffs ** 2) * self.precision_weights, axis=1)  
+        nearest = self.X[np.argmin(dists)]  
         
-        # Weight the squared differences. If a dimension is highly variable across 
-        # all known patterns, we care less about errors in that specific dimension.
-        dists = np.sum((diffs ** 2) * self.precision_weights, axis=1)  # (K,)
-        nearest = self.X[np.argmin(dists)]  # (N,)
-        
-        # Step 2: Identify trustworthy dimensions via absolute error
         error = np.abs(corrupted_query - nearest)
-        
-        # Transform error into a raw trust score between (0, 1].
-        # Exact match = 1.0. Infinite error = 0.0.
         trust = np.exp(-error / temperature)
+        precision_python = self.pi_min + trust * (self.pi_max - self.pi_min)
+        precision_python = np.clip(precision_python, self.pi_min, self.pi_max)
+
+        # --- PATH B: High-Performance Rust PCAM Engine ---
+        precision_rust = np.array(self.rust_engine.predict(corrupted_query.tolist()))
+
+        # --- BLENDING: Working together ---
+        # The Rust engine handles structural R-projections and dynamic masking well,
+        # while the Python engine handles variance-weighting. Averaging them gives the best of both!
+        final_precision = (precision_python + precision_rust) / 2.0
         
-        # Step 3: Absolute Scaling to [pi_min, pi_max]
-        # Instead of relativistic scaling (which artificially boosts garbage data),
-        # we map the (0, 1] trust range directly to the [pi_min, pi_max] range.
-        precision = self.pi_min + trust * (self.pi_max - self.pi_min)
-        
-        # Final clip to safeguard against any floating-point anomalies
-        return np.clip(precision, self.pi_min, self.pi_max)
+        return np.clip(final_precision, self.pi_min, self.pi_max)
