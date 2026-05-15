@@ -10,12 +10,9 @@ mod python_bridge {
     use pyo3::prelude::*;
     use ndarray::{Array1, Array2};
 
-    use crate::pcam::optimize::optimize_precision;
-
     #[pyclass]
     pub struct RustEngine {
         patterns: Array2<f64>,
-        precisions: Vec<Array1<f64>>,
         #[allow(dead_code)]
         r: Array2<f64>,
         #[allow(dead_code)]
@@ -35,7 +32,6 @@ mod python_bridge {
             if n_patterns == 0 {
                 return Ok(RustEngine {
                     patterns: Array2::zeros((0, 0)),
-                    precisions: vec![],
                     r: Array2::zeros((0, 0)),
                     beta: 1.0,
                     n_dims: 0,
@@ -57,17 +53,8 @@ mod python_bridge {
             let patterns = Array2::from_shape_vec((n_patterns, n_dims), patterns_flat)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
 
-            // Pre-compute per-pattern precision vectors offline
-            let precisions: Vec<Array1<f64>> = (0..n_patterns)
-                .map(|mu| {
-                    let xi = patterns.row(mu).to_owned();
-                    optimize_precision(&xi, &patterns, &r, beta, 200)
-                })
-                .collect();
-
             Ok(RustEngine {
                 patterns,
-                precisions,
                 r,
                 beta,
                 n_dims,
@@ -97,48 +84,58 @@ mod python_bridge {
                 )));
             }
 
-            let query = Array1::from_vec(corrupted_query);
+            let query = Array1::from_vec(corrupted_query.clone());
+            let mut precision = vec![1.0; self.n_dims];
 
-            // ── Step 1: Compute softmax weights over pattern similarities ──
-            let sims = self.patterns.dot(&query);
+            // 1. Compute NEGATIVE SQUARED DISTANCE instead of Dot Product
+            // We use negative distance so that CLOSER patterns have a HIGHER (less negative) score,
+            // which allows the Softmax function to work correctly.
+            let diff = &self.patterns - &query;
+            let dist_sq = diff.mapv(|x| x * x).sum_axis(ndarray::Axis(1));
+            let sims = -dist_sq;
+
+            // 2. Find max similarity for numerical stability
             let max_sim = sims.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
-            let exp_sims = sims.mapv(|s| (s - max_sim).exp());
+            // 3. THE FIX: Temperature-Scaled Softmax
+            let temperature = 10.0; 
+            
+            let exp_sims = sims.mapv(|s| ((s - max_sim) / temperature).exp());
             let sum_exp = exp_sims.sum();
+            
+            // Normalize into probability weights
             let weights = if sum_exp > 0.0 {
                 exp_sims / sum_exp
             } else {
                 Array1::ones(self.n_patterns) / (self.n_patterns as f64)
             };
 
-            // ── Step 2: Blend per-pattern precisions ──
-            let mut blended: Array1<f64> = Array1::zeros(self.n_dims);
+            // 4. Create the "Blended Target"
+            // Instead of picking ONE pattern, we build a ghost pattern out of the probabilities.
+            // If the query is 50% P1 and 50% P2, this blended target will perfectly reflect that.
+            let mut blended_target: Array1<f64> = Array1::zeros(self.n_dims);
             for (mu, &w) in weights.iter().enumerate() {
-                if w > 1e-15 {
-                    let scaled: Array1<f64> = &self.precisions[mu] * w;
-                    blended = blended + scaled;
+                if w > 0.001 { // Optimization: ignore negligible weights
+                    let scaled: Array1<f64> = self.patterns.row(mu).to_owned() * w;
+                    blended_target = blended_target + scaled;
                 }
             }
 
-            // ── Step 3: Reliability mask ──
-            // Down-weight dimensions where the query deviates heavily from the
-            // weighted pattern mean (likely corrupted).
-            let mut weighted_mean: Array1<f64> = Array1::zeros(self.n_dims);
-            for (mu, &w) in weights.iter().enumerate() {
-                if w > 1e-15 {
-                    let pat: Array1<f64> = self.patterns.row(mu).to_owned();
-                    let scaled: Array1<f64> = pat * w;
-                    weighted_mean = weighted_mean + scaled;
-                }
+            // 5. Calculate Final Precision based on the Blended Target
+            for i in 0..self.n_dims {
+                // How far is the query from our intelligent blend?
+                let deviation: f64 = f64::abs(corrupted_query[i] - blended_target[i]);
+                
+                // Smooth continuous mapping:
+                // 0.0 deviation -> High precision (10.0)
+                // High deviation -> Low precision (0.1)
+                let continuous_p: f64 = 10.0 / (1.0 + deviation * 3.0); 
+                
+                // Clamp it just to be safe for the hackathon harness
+                precision[i] = continuous_p.clamp(0.1, 10.0);
             }
-            let deviation: Array1<f64> = (&query - &weighted_mean).mapv(|x| x.abs());
-            let reliability = deviation.mapv(|d| (-2.0 * d).exp()); // λ = 2.0
-            blended = blended * &reliability;
 
-            // ── Step 4: Clamp to harness range [0.1, 10.0] ──
-            let result: Vec<f64> = blended.iter().map(|&v| v.max(0.1).min(10.0)).collect();
-
-            Ok(result)
+            Ok(precision)
         }
     }
 
