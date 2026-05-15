@@ -1,2 +1,7 @@
 /target
 .venv/
+
+__pycache__/
+
+hidden_tests.py
+mock_test.py
